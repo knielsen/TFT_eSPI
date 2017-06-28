@@ -24,9 +24,7 @@
 //#include <limits.h>
 //#include "pins_arduino.h"
 //#include "wiring_private.h"
-#ifndef ST7787_DRIVER
 #include <SPI.h>
-#endif
 
 // If it is a 16bit serial display we must transfer 16 bits every time
 #ifdef RPI_ILI9486_DRIVER
@@ -46,7 +44,13 @@ void spiWriteBlock(uint16_t color, uint32_t repeat);
 inline void TFT_eSPI::spi_begin(void){
 #ifdef SPI_HAS_TRANSACTION
   #ifdef SUPPORT_TRANSACTIONS
-    if (locked) {locked = false; SPI.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, SPI_MODE0));}
+    if (locked) {
+      locked = false;
+      SPI.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, SPI_MODE0));
+    #ifdef IFACE_3WIRE_ESP8266
+      SPI1U |= (uint32_t)(SPIUWRBYO|SPIURDBYO);
+    #endif
+    }
   #endif
 #endif
 }
@@ -54,7 +58,15 @@ inline void TFT_eSPI::spi_begin(void){
 inline void TFT_eSPI::spi_end(void){
 #ifdef SPI_HAS_TRANSACTION
   #ifdef SUPPORT_TRANSACTIONS
-  if(!inTransaction) {if (!locked) {locked = true; SPI.endTransaction();}}
+  if(!inTransaction) {
+    if (!locked) {
+      locked = true;
+      SPI.endTransaction();
+      #ifdef IFACE_3WIRE_ESP8266
+      SPI1U &= ~(uint32_t)(SPIUWRBYO|SPIURDBYO);
+      #endif
+    }
+  }
   #endif
 #endif
 }
@@ -185,10 +197,11 @@ void TFT_eSPI::init(void)
     cspinmask = (uint32_t) digitalPinToBitMask(TFT_CS);
   #endif
 
-#ifndef ST7787_DRIVER
-  SPI.begin(); // This will set MISO to input
-#endif
+  #if !defined(IFACE_3WIRE) || defined(IFACE_3WIRE_ESP8266)
+    SPI.begin(); // This will set MISO to input
+  #endif
 #else
+  // ToDo: handle 3-wire interface on ESP32.
   #ifdef TFT_MOSI
     SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, -1);
   #else
@@ -200,13 +213,15 @@ void TFT_eSPI::init(void)
   inTransaction = false;
   locked = true;
 
-#ifdef ST7787_DRIVER
 #ifndef SUPPORT_TRANSACTIONS
 
   SPI.setBitOrder(MSBFIRST);
   SPI.setDataMode(SPI_MODE0);
   SPI.setFrequency(SPI_FREQUENCY);
   //SPI.setHwCs(1); // Use hardware SS toggling on GPIO15 (D8) - not supported - benefit is only ~0.8% performance boost
+  #ifdef IFACE_3WIRE_ESP8266
+    SPI1U |= (uint32_t)(SPIUWRBYO|SPIURDBYO);
+  #endif
   
   #ifdef ESP32 // Unlock the SPI hal mutex and set the lock management flags
     SPI.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, SPI_MODE0));
@@ -214,7 +229,6 @@ void TFT_eSPI::init(void)
     locked = false;       // Flag to stop repeat beginTransaction calls
   #endif
 
-#endif
 #endif
 
   // Set to output once again in case D6 (MISO) is used for CS
@@ -360,6 +374,62 @@ void TFT_eSPI::spiwrite(uint8_t c)
 }
 
 
+#ifdef IFACE_3WIRE
+  #ifdef IFACE_3WIRE_ESP8266
+void TFT_eSPI::docommand(uint8_t c, uint8_t *in, uint32_t in_len, uint8_t *out, uint32_t out_len)
+{
+  uint32_t i;
+  uint32_t val;
+
+  CS_L;
+
+  uint32_t mask = ~((SPIMMOSI << SPILMOSI) | (SPIMMISO << SPILMISO));
+  mask = SPI1U1 & mask;
+
+  // Send the command byte, with a '0' DC bit.
+  SPI1U1 = mask | ((CMD_BITS+1) << SPILMOSI) | ((CMD_BITS+1) << SPILMISO);
+  SPI1W0 = (uint32_t)c << 23;
+  SPI1CMD |= SPIBUSY;
+  while(SPI1CMD & SPIBUSY) {}
+
+  if (in_len) {
+    do {
+      val = *in++;
+
+      SPI1U1 = mask | ((CMD_BITS+1) << SPILMOSI) | ((CMD_BITS+1) << SPILMISO);
+      SPI1W0 = (uint32_t)0x80000000 | (val << 23);
+      SPI1CMD |= SPIBUSY;
+      val <<= 1;
+      --in_len;
+      while(SPI1CMD & SPIBUSY) {}
+    } while (in_len > 0);
+  }
+
+  if (out_len) {
+    // temporarily disable the MOSI pin while we read into MISO.
+    pinMode(MOSI, INPUT);
+
+    SPI1U1 = mask | ((CMD_BITS+1) << SPILMOSI) | ((CMD_BITS+1) << SPILMISO);
+    SPI1W0 = 0;
+    SPI1CMD |= SPIBUSY;
+    while(SPI1CMD & SPIBUSY) {}
+    *out++ = SPI1W0 >> 23;
+
+    while (--out_len > 0) {
+      SPI1U1 = mask | (CMD_BITS << SPILMOSI) | (CMD_BITS << SPILMISO);
+      SPI1W0 = 0;
+      SPI1CMD |= SPIBUSY;
+      while(SPI1CMD & SPIBUSY) {}
+      *out++ = SPI1W0 >> 24;
+    }
+
+    pinMode(MOSI, SPECIAL);
+  }
+
+  CS_H;
+}
+
+  #else
 void TFT_eSPI::docommand(uint8_t c, uint8_t *in, uint32_t in_len, uint8_t *out, uint32_t out_len)
 {
   uint32_t i;
@@ -447,21 +517,76 @@ void TFT_eSPI::docommand(uint8_t c, uint8_t *in, uint32_t in_len, uint8_t *out, 
   delay_ns(ST7787_T_CHW);
 }
 
+  #endif
+#endif
 
 /***************************************************************************************
 ** Function name:           writecommand
 ** Description:             Send an 8 bit command to the TFT
 ***************************************************************************************/
+#ifdef IFACE_3WIRE
+#ifdef IFACE_3WIRE_ESP8266
+void TFT_eSPI::writecommand(uint8_t c)
+{
+  CS_L;
+
+  uint32_t mask = ~((SPIMMOSI << SPILMOSI) | (SPIMMISO << SPILMISO));
+  mask = SPI1U1 & mask;
+
+  SPI1U1 = mask | ((CMD_BITS+1) << SPILMOSI) | ((CMD_BITS+1) << SPILMISO);
+
+  SPI1W0 = (uint32_t)c << 23;
+  SPI1CMD |= SPIBUSY;
+  while(SPI1CMD & SPIBUSY) {}
+
+  CS_H;
+}
+
+#else
 void TFT_eSPI::writecommand(uint8_t c)
 {
   docommand(c, NULL, 0, NULL, 0);
 }
+#endif
+#else
 
+void TFT_eSPI::writecommand(uint8_t c)
+{
+  DC_C;
+  CS_L;
+  #ifdef SEND_16_BITS
+    SPI.transfer(0);
+  #endif
+  SPI.transfer(c);
+  CS_H;
+  DC_D;
+}
+
+#endif  /* IFACE_3WIRE */
 
 /***************************************************************************************
 ** Function name:           writedata
 ** Description:             Send a 8 bit data value to the TFT
 ***************************************************************************************/
+#ifdef IFACE_3WIRE
+#ifdef IFACE_3WIRE_ESP8266
+void TFT_eSPI::writedata(uint8_t c)
+{
+  CS_L;
+
+  uint32_t mask = ~((SPIMMOSI << SPILMOSI) | (SPIMMISO << SPILMISO));
+  mask = SPI1U1 & mask;
+
+  SPI1U1 = mask | ((CMD_BITS+1) << SPILMOSI) | ((CMD_BITS+1) << SPILMISO);
+
+  SPI1W0 = (uint32_t)0x80000000 | ((uint32_t)c << 23);
+  SPI1CMD |= SPIBUSY;
+  while(SPI1CMD & SPIBUSY) {}
+
+  CS_H;
+}
+
+#else
 void TFT_eSPI::writedata(uint8_t c)
 {
   uint32_t i;
@@ -497,7 +622,19 @@ void TFT_eSPI::writedata(uint8_t c)
   CS_H;
   delay_ns(ST7787_T_CHW);
 }
+#endif
+#else  /* !IFACE_3WIRE */
+ void TFT_eSPI::writedata(uint8_t c)
+ {
+   CS_L;
+  #ifdef SEND_16_BITS
+    SPI.transfer(0);
+  #endif
+  SPI.transfer(c);
+  CS_H;
+}
 
+#endif
 
 /***************************************************************************************
 ** Function name:           readcommand8 (for ILI9341 Interface II i.e. IM [3:0] = "1101")
@@ -3741,11 +3878,71 @@ void TFT_eSPI::setTextFont(uint8_t f)
 #endif
 
 
+#define STARTBITS(cur_, pos_, spireg_) { cur_ = 0; pos_ = 32; spireg_ = &SPI1W0; }
+#define ADDBITS(val_, bits_, cur_, pos_, spireg_) { \
+  if (pos_ < bits_)                                 \
+  {                                                 \
+    cur_ |= val_ >> (bits_ - pos_);                 \
+    *spireg_++ = cur_;                              \
+    pos_ = 32 - (bits_ - pos_);                     \
+    cur_ = ((uint32_t)val_ << pos_);                \
+  } else {                                          \
+    pos_ -= bits_;                                  \
+    cur_ |= ((uint32_t)val_ << pos_);               \
+  }                                                 \
+}
+#define FLUSHBITS(cur_, spireg_) { *spireg_ = cur_; }
+
 /***************************************************************************************
 ** Function name:           spiBlockWrite
 ** Description:             Write a block of pixels of the same colour
 ***************************************************************************************/
-#if defined(ESP8266) && defined(ST7787_DRIVER)
+#ifdef IFACE_3WIRE
+#ifdef IFACE_3WIRE_ESP8266
+void spiWriteBlock(uint16_t color, uint32_t repeat)
+{
+  uint32_t mask = ~(SPIMMOSI << SPILMOSI);
+  mask = SPI1U1 & mask;
+
+  // Stuff two color bytes with two '1' DC bits.
+  uint32_t color18 = (uint32_t)0x20100 | (((uint32_t)color & 0xff00) << 1) | (color & 0xff);
+  uint32_t cur, pos;
+  volatile uint32_t *spireg;
+
+  STARTBITS(cur, pos, spireg);
+  SPI1U = SPIUMOSI | SPIUSSE | SPIUWRBYO | SPIURDBYO;
+
+  uint32_t fillcount = repeat;
+  if (fillcount > 28)
+    fillcount = 28;
+  while (fillcount-- > 0)
+    ADDBITS(color18, 18, cur, pos, spireg);
+  FLUSHBITS(cur, spireg);
+
+  if (repeat >= 28)
+  {
+    SPI1U1 = mask | ((18*28-1) << SPILMOSI);
+    while(repeat>=28)
+    {
+      while(SPI1CMD & SPIBUSY) {}
+      SPI1CMD |= SPIBUSY;
+      repeat -= 28;
+    }
+    while(SPI1CMD & SPIBUSY) {}
+  }
+
+  if (repeat)
+  {
+    repeat = (repeat * 18) - 1;
+    SPI1U1 = mask | (repeat << SPILMOSI);
+    SPI1CMD |= SPIBUSY;
+    while(SPI1CMD & SPIBUSY) {}
+  }
+
+  SPI1U = SPIUMOSI | SPIUDUPLEX | SPIUSSE | SPIUWRBYO | SPIURDBYO;
+}
+
+#else
 void spiWriteBlock(uint16_t color, uint32_t repeat)
 {
   uint32_t i;
@@ -3800,6 +3997,7 @@ void spiWriteBlock(uint16_t color, uint32_t repeat)
   DAT_I;
 }
 
+#endif  /* IFACE_3WIRE */
 #elif defined (ESP8266) && (SPI_FREQUENCY != 80000000)
 void spiWriteBlock(uint16_t color, uint32_t repeat)
 {
