@@ -80,10 +80,10 @@ inline void TFT_eSPI::spi_end(void){
   if(!inTransaction) {
     if (!locked) {
       locked = true;
-      SPI.endTransaction();
-      #ifdef IFACE_3WIRE_ESP8266
+    #ifdef IFACE_3WIRE_ESP8266
       SPI1U &= ~(uint32_t)(SPIUWRBYO|SPIURDBYO);
-      #endif
+    #endif
+      SPI.endTransaction();
     }
   }
   #endif
